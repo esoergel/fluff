@@ -1,7 +1,9 @@
 from couchdbkit import ResourceNotFound
 from couchdbkit.ext.django import schema
 import datetime
+from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.parsing import json_format_date
+from fluff import exceptions
 from pillowtop.listener import BasicPillow
 from .signals import indicator_document_updated
 
@@ -16,6 +18,11 @@ def null_emitter(fn):
     return fn
 
 
+def post_process(fn):
+    fn._fluff_emitter = 'delayed'
+    return fn
+
+
 def filter_by(fn):
     fn._fluff_filter = True
     return fn
@@ -27,6 +34,7 @@ class CalculatorMeta(type):
     def __new__(mcs, name, bases, attrs):
         emitters = set()
         filters = set()
+
         parents = [p for p in bases if isinstance(p, CalculatorMeta)]
         for attr in attrs:
             if getattr(attrs[attr], '_fluff_emitter', None):
@@ -51,6 +59,7 @@ class Calculator(object):
     __metaclass__ = CalculatorMeta
 
     window = None
+    offsets = None
 
     # set by IndicatorDocumentMeta
     fluff = None
@@ -63,11 +72,27 @@ class Calculator(object):
     def __init__(self, window=None):
         if window is not None:
             self.window = window
+        self.offsets = self.offsets or {}
+        emitters_not_covered = set(self._fluff_emitters)
+        for emitter in set(self.offsets.keys() or {}) & emitters_not_covered:
+            emitters_not_covered.remove(emitter)
+
+        if self.window:
+            emitters_not_covered.clear()
+
         if not isinstance(self.window, datetime.timedelta):
             # if window is set to None, for instance
             # fail here and not whenever that's run into below
             raise NotImplementedError(
                 'window must be timedelta, not %s' % type(self.window))
+
+        if emitters_not_covered:
+            raise NotImplementedError(
+                'The following emitters need to be added to your offsets, '
+                'or you need to define a (default) window: %s' % (
+                    ', '.join(emitters_not_covered)
+                )
+            )
 
     def filter(self, item):
         return True
@@ -81,14 +106,87 @@ class Calculator(object):
         )
         values = {}
         for slug in self._fluff_emitters:
-            values[slug] = (
-                list(getattr(self, slug)(item))
-                if passes_filter else []
-            )
+            emitter = getattr(self, slug)
+            # 'delayed' is done with post-processing
+            if emitter._fluff_emitter in ('date', 'null'):
+                values[slug] = (
+                    list(emitter(item))
+                    if passes_filter else []
+                )
         return values
+
+    def get_window(self, now, emitter):
+        if emitter in self.offsets:
+            start, end = self.offsets[emitter]
+            return now + start, now + end
+        else:
+            return now - self.window, now
 
     def get_result(self, key, reduce=True):
         return self.fluff.get_result(self.slug, key, reduce=reduce)
+
+
+class FluffResult(object):
+    def __init__(self, indicator_doc, calc_name, key):
+        self.indicator_doc = indicator_doc
+        self.calc_name = calc_name
+        self.key = key
+
+    @property
+    @memoized
+    def calculator(self):
+        return self.indicator_doc.get_calculator(self.calc_name)
+
+    def get(self, slug):
+        return self._get(slug, reduce=True)
+
+    def get_ids(self, slug):
+        return self._get(slug, reduce=False)
+
+    @memoized
+    def _get(self, slug, reduce):
+        doc_type = self.indicator_doc._doc_type
+        shared_key = [doc_type] + self.key + [self.calc_name, slug]
+        emitter = getattr(self.calculator, slug)
+        emitter_type = emitter._fluff_emitter
+
+        if emitter_type == 'date':
+            now = datetime.datetime.utcnow().date()
+            start, end = self.calculator.get_window(now, slug)
+            q = self.indicator_doc.view(
+                'fluff/generic',
+                startkey=shared_key + [json_format_date(start)],
+                endkey=shared_key + [json_format_date(end)],
+                reduce=reduce,
+            ).all()
+        elif emitter_type == 'null':
+            q = self.indicator_doc.view(
+                'fluff/generic',
+                key=shared_key + [None],
+                reduce=reduce,
+            ).all()
+        elif emitter_type == 'delayed':
+            ids = emitter(self)
+            if reduce:
+                return len(ids)
+            else:
+                return ids
+        else:
+            raise exceptions.EmitterTypeError(
+                'emitter type %s not recognized' % emitter_type
+            )
+
+        if reduce:
+            try:
+                return q[0]['value']
+            except IndexError:
+                return 0
+        else:
+            def strip(id_string):
+                prefix = '%s-' % cls.__name__
+                assert id_string.startswith(prefix)
+                return id_string[len(prefix):]
+            return [strip(row['id']) for row in q]
 
 
 class IndicatorDocumentMeta(schema.DocumentMeta):
@@ -226,39 +324,12 @@ class IndicatorDocument(schema.Document):
 
     @classmethod
     def get_result(cls, calc_name, key, reduce=True):
-        calculator = cls.get_calculator(calc_name)
-        result = {}
-        for emitter_name in calculator._fluff_emitters:
-            shared_key = [cls._doc_type] + key + [calc_name, emitter_name]
-            emitter_type = getattr(calculator, emitter_name)._fluff_emitter
-            q_args = {
-                'reduce': reduce,
-                'include_docs': not reduce,
-            }
-            if emitter_type == 'date':
-                now = datetime.datetime.utcnow().date()
-                start = now - calculator.window
-                end = now
-                q = cls.view(
-                    'fluff/generic',
-                    startkey=shared_key + [json_format_date(start)],
-                    endkey=shared_key + [json_format_date(end)],
-                    **q_args
-                ).all()
-            elif emitter_type == 'null':
-                q = cls.view(
-                    'fluff/generic',
-                    key=shared_key + [None],
-                    **q_args
-                ).all()
-            if reduce:
-                try:
-                    result[emitter_name] = q[0]['value']
-                except IndexError:
-                    result[emitter_name] = 0
-            else:
-                result[emitter_name] = q
-        return result
+        print cls, calc_name, key, reduce
+        result = FluffResult(cls, calc_name, key)
+        serialized = {}
+        for emitter_name in result.calculator._fluff_emitters:
+            serialized[emitter_name] = result._get(emitter_name, reduce=reduce)
+        return serialized
 
     class Meta:
         app_label = 'fluff'
