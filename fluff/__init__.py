@@ -183,7 +183,7 @@ class FluffResult(object):
                 return 0
         else:
             def strip(id_string):
-                prefix = '%s-' % cls.__name__
+                prefix = '%s-' % self.indicator_doc.__name__
                 assert id_string.startswith(prefix)
                 return id_string[len(prefix):]
             return [strip(row['id']) for row in q]
