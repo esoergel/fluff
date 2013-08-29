@@ -39,6 +39,8 @@ class VisitCalculator(fluff.Calculator):
             if is_temp(case):
                 yield [action.date, action.temperature]
     
+    # note: unlike the IndicatorDoc level group_by below, you must
+    # use a list for group_by 
     @fluff.date_emitter
     def group_list(self, case):
         yield dict(date=date(2013, 1, 1), value=3, group_by=['abc', 'xyz'])
